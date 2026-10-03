@@ -175,11 +175,13 @@ func sameSpec(a, b Rule) bool {
 // 乱序但仍在容忍范围内：正常接收并在最终化时确定性重算；
 // 超过容忍范围（目标桶已最终化）：返回包装 ErrTooLate 的错误，绝不静默丢弃。
 func (e *Engine) Observe(ev Event) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// 不带时间戳的事件在锁内按当前水位补齐：与 Advance/并发 Observe 的
+	// 任意交错都满足"同一时刻只有一个评估顺序"，无数据竞争且结论可复现。
 	if ev.At.IsZero() {
 		ev.At = e.wm
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	e.arrival++
 	var lateTargets []string
@@ -211,6 +213,13 @@ func (e *Engine) finalizedBefore(vs *versionState, b int64) bool {
 	}
 	cutoff := e.wm.Add(-e.lateness).UnixNano()
 	return b+vs.rule.Window.Nanoseconds() <= cutoff
+}
+
+// Watermark 返回当前水位（不加锁读取会构成数据竞争，故提供访问器）。
+func (e *Engine) Watermark() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.wm
 }
 
 // LateError 携带迟到事件的现场信息，errors.Is(err, ErrTooLate) 成立。
