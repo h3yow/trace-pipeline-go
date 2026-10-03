@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ func main() {
 	fmt.Println()
 	fmt.Println("================ 3) 时间窗口告警（乱序/抑制/版本） ================")
 	demoAlerting()
+
+	fmt.Println()
+	fmt.Println("================ 4) 告警结论持久化 / 跨进程重放 / 压缩 ================")
+	demoJournal()
 }
 
 func demoCorrelation() {
@@ -196,4 +201,85 @@ func demoAlerting() {
 	fmt.Printf("规则版本化: 现存版本数=%d; v1(threshold=%d)保留告警数=%d; 当前为 v%d(threshold=%d)\n",
 		len(all), all[0].Rule.Threshold, len(all[0].Alerts),
 		all[len(all)-1].Rule.Version, all[len(all)-1].Rule.Threshold)
+}
+
+// demoJournal 演示：关键输入落盘 -> "进程重启"后只靠记录还原结论 ->
+// 压缩历史 -> 再还原，结论始终逐字段一致。
+func demoJournal() {
+	dir, err := os.MkdirTemp("", "alert-journal-demo")
+	if err != nil {
+		fmt.Println("创建临时目录失败:", err)
+		return
+	}
+	defer os.RemoveAll(dir)
+	base := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+
+	// --- 第一个"进程"：在线评估并落盘 ---
+	eng := alert.NewEngine(10 * time.Second)
+	j, err := alert.OpenJournal(dir)
+	if err != nil {
+		fmt.Println("打开记录失败:", err)
+		return
+	}
+	if err := eng.SetJournal(j); err != nil {
+		fmt.Println("挂载记录失败:", err)
+		return
+	}
+	_ = eng.AddRule(alert.Rule{ID: "err-rate", Metric: "errors",
+		Op: alert.OpGreaterEqual, Threshold: 3, Window: time.Minute, Suppress: 2 * time.Minute})
+	for _, sec := range []int{20, 0, 10} { // 乱序事件
+		_ = eng.Observe(alert.Event{Metric: "errors", Value: 1,
+			At: base.Add(time.Duration(sec) * time.Second), CorrID: "cp-1"})
+	}
+	fired := eng.Advance(base.Add(70 * time.Second)) // 桶 10:00 触发
+	// 零时间戳事件：按当前水位补齐（先推进到 10:03，避开抑制期）
+	eng.Advance(base.Add(3 * time.Minute))
+	_ = eng.Observe(alert.Event{Metric: "errors", Value: 5, CorrID: "cp-2"}) // 零时间戳 -> 补为 10:03:00
+	fired2 := eng.Advance(base.Add(5 * time.Minute)) // 桶 10:03 触发
+	fmt.Printf("进程1: 触发告警=%d条(桶10:00)+%d条(零时间戳事件补齐到桶10:03); 关键输入已写入 %s/{baseline.json,journal.log}\n",
+		len(fired), len(fired2), dir)
+
+	// 压缩：早期历史折叠为基线
+	if err := eng.Compact(); err != nil {
+		fmt.Println("压缩失败:", err)
+		return
+	}
+	// 压缩后继续跑：规则变更 + 新事件（v2 阈值 10，value=5 不触发）
+	_ = eng.AddRule(alert.Rule{ID: "err-rate", Metric: "errors",
+		Op: alert.OpGreaterEqual, Threshold: 10, Window: time.Minute, Suppress: 2 * time.Minute})
+	_ = eng.Observe(alert.Event{Metric: "errors", Value: 5,
+		At: base.Add(5*time.Minute + 5*time.Second), CorrID: "cp-3"})
+	eng.Advance(base.Add(7 * time.Minute)) // 桶 10:05 最终化：v2 下 value=5<10 不触发
+	online := eng.History("err-rate")
+	j.Close()
+	fmt.Printf("进程1: 压缩完成, 继续运行至规则v%d; 在线历史版本数=%d\n",
+		online[len(online)-1].Rule.Version, len(online))
+
+	// --- 第二个"进程"：只靠记录还原 ---
+	eng2, j2, err := alert.Restore(dir)
+	if err != nil {
+		fmt.Println("还原失败:", err)
+		return
+	}
+	defer j2.Close()
+	replayed := eng2.History("err-rate")
+	match := len(replayed) == len(online)
+	for i := range replayed {
+		if len(replayed[i].Alerts) != len(online[i].Alerts) ||
+			len(replayed[i].Fired) != len(online[i].Fired) ||
+			len(replayed[i].Suppressed) != len(online[i].Suppressed) ||
+			len(replayed[i].Finalized) != len(online[i].Finalized) {
+			match = false
+		}
+	}
+	for _, vh := range replayed {
+		fmt.Printf("进程2: 还原 v%d(threshold=%d): fired=%d suppressed=%d finalized=%d alerts=%d\n",
+			vh.Rule.Version, vh.Rule.Threshold,
+			len(vh.Fired), len(vh.Suppressed), len(vh.Finalized), len(vh.Alerts))
+	}
+	if match {
+		fmt.Println("结论: 压缩+重启后, 触发/抑制/最终化与告警内容与在线运行逐字段一致。")
+	} else {
+		fmt.Println("结论: [异常] 还原结论与在线运行不一致!")
+	}
 }

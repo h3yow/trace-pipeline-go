@@ -128,6 +128,7 @@ type Engine struct {
 	wm       time.Time // 当前水位
 	rules    map[string]*ruleEntry
 	arrival  int
+	journal  *Journal // 非空时每次状态变更同步持久化（同一临界区内）
 }
 
 // NewEngine 创建告警评估引擎，lateness 为可容忍乱序时间（>=0）。
@@ -163,6 +164,13 @@ func (e *Engine) AddRule(r Rule) error {
 	}
 	entry.versions = append(entry.versions, newVersionState(r))
 	e.rules[r.ID] = entry
+	// 记录"生效后的当前规则"（含版本号）；重放时同样走 AddRule 的版本
+	// 判重/升级逻辑，版本演进逐次复现。同定义重复添加是无状态影响的 no-op，
+	// 上面已提前返回，无需记录。
+	if e.journal != nil {
+		cur := entry.versions[len(entry.versions)-1].rule
+		_ = e.journal.appendRec(record{Kind: recRule, Rule: &cur})
+	}
 	return nil
 }
 
@@ -175,14 +183,18 @@ func sameSpec(a, b Rule) bool {
 // 乱序但仍在容忍范围内：正常接收并在最终化时确定性重算；
 // 超过容忍范围（目标桶已最终化）：返回包装 ErrTooLate 的错误，绝不静默丢弃。
 func (e *Engine) Observe(ev Event) error {
-	if ev.At.IsZero() {
-		ev.At = e.wm
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// 不带时间戳的事件按"被评估时"的当前水位补齐：补齐与入桶、水位推进
+	// 在同一临界区内原子完成，因此与 Advance/并发写入任意交错都不会
+	// 出现补齐到已关闭窗口、丢失或数据竞争。
+	if ev.At.IsZero() {
+		ev.At = e.wm
+	}
 	e.arrival++
 	var lateTargets []string
+	var err error
 	for _, entry := range e.rules {
 		vs := entry.versions[len(entry.versions)-1]
 		if vs.rule.Metric != ev.Metric {
@@ -198,9 +210,16 @@ func (e *Engine) Observe(ev Event) error {
 		vs.buckets[b] = append(vs.buckets[b], eventRec{Event: ev, arrival: e.arrival})
 	}
 	if len(lateTargets) > 0 {
-		return &LateError{Cause: ErrTooLate, Rules: lateTargets, At: ev.At, Wm: e.wm}
+		err = &LateError{Cause: ErrTooLate, Rules: lateTargets, At: ev.At, Wm: e.wm}
 	}
-	return nil
+	// 无论是否被部分/全部拒绝都记录：Observe 已消耗到达序号，且对部分规则
+	// 可能已入桶；记录的是补齐后的生效事件，重放走同一 Observe 逻辑逐次复现。
+	if e.journal != nil {
+		_ = e.journal.appendRec(record{Kind: recEvent, Event: &eventSnap{
+			Metric: ev.Metric, Value: ev.Value, At: ev.At.UnixNano(), CorrID: string(ev.CorrID),
+		}})
+	}
+	return err
 }
 
 // finalizedBefore 判断桶 b 是否落在最终化线之前（桶已永久关闭）。
@@ -250,8 +269,15 @@ func (e *Engine) Advance(t time.Time) []Alert {
 	}
 	cutoff := e.wm.Add(-e.lateness).UnixNano()
 
+	// 按规则 ID 排序遍历：跨规则的告警返回顺序也确定，重放输出逐位一致。
+	ids := make([]string, 0, len(e.rules))
+	for id := range e.rules {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
 	var fired []Alert
-	for _, entry := range e.rules {
+	for _, id := range ids {
+		entry := e.rules[id]
 		for _, vs := range entry.versions {
 			// 收集需最终化的桶，按起始时间升序处理（抑制判定依赖时序）。
 			var pending []int64
@@ -265,6 +291,10 @@ func (e *Engine) Advance(t time.Time) []Alert {
 				fired = append(fired, e.finalize(vs, b)...)
 			}
 		}
+	}
+	// 记录推进目标（包括未生效的倒退推进）：重放走同一 Advance 逻辑。
+	if e.journal != nil {
+		_ = e.journal.appendRec(record{Kind: recAdvance, At: t.UnixNano()})
 	}
 	return fired
 }
