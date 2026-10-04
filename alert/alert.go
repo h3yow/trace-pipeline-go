@@ -222,6 +222,13 @@ func (e *Engine) Watermark() time.Time {
 	return e.wm
 }
 
+// Lateness 返回引擎的乱序容忍设置（记录还原时以记录里的值重建）。
+func (e *Engine) Lateness() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lateness
+}
+
 // LateError 携带迟到事件的现场信息，errors.Is(err, ErrTooLate) 成立。
 type LateError struct {
 	Cause error
@@ -282,6 +289,10 @@ func (e *Engine) Advance(t time.Time) []Alert {
 func (e *Engine) finalize(vs *versionState, b int64) []Alert {
 	vs.finalized[b] = true
 	recs := vs.buckets[b]
+	// 桶一旦最终化即永久关闭（迟到事件由 finalized 标记拒绝），桶内事件
+	// 不再参与任何后续判定，立即释放——引擎内存只随"未最终化窗口"增长，
+	// 不随累计写入量增长。重放走同一代码路径，还原结论不受影响。
+	delete(vs.buckets, b)
 	sort.SliceStable(recs, func(i, j int) bool {
 		if recs[i].At.Equal(recs[j].At) {
 			return recs[i].arrival < recs[j].arrival

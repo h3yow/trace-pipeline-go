@@ -30,16 +30,23 @@ type Recorder struct {
 	compactHook func() error
 }
 
-// OpenRecorder 打开（或创建）dir 下的记录目录：
-// 若存在快照则先恢复快照状态，再重放日志中 Seq 大于快照序号的记录；
-// 不存在任何记录时以 lateness 新建引擎。恢复后可直接继续写入。
-func OpenRecorder(dir string, lateness time.Duration) (*Recorder, error) {
+// OpenRecorder 打开（或创建）dir 下的记录目录。还原只依赖目录里录进去的内容，
+// 不依赖调用方传入的设置值：
+//   - 已有记录（快照或日志）时：lateness 以记录里的为准——快照存了评估设置，
+//     日志的第一条记录也是它；此时传入的 lateness 被忽略，传错、不传都不影响
+//     还原结论；
+//   - 全新目录时：以传入的 lateness（缺省为 0）创建记录，并把该设置作为第一条
+//     日志记录（RecConfig）落盘，此后任何进程打开都不再需要它。
+//
+// 还原顺序：有快照则先恢复快照状态，再流式重放日志中 Seq 大于快照序号的记录；
+// 恢复后可直接继续写入。
+func OpenRecorder(dir string, lateness ...time.Duration) (*Recorder, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	r := &Recorder{dir: dir, lateness: lateness}
+	r := &Recorder{dir: dir}
 
-	// 1) 快照（压缩基线）：存在则以其为准（lateness 以快照记录为准）。
+	// 1) 快照（压缩基线）：存在则以其为准（评估设置也取自快照）。
 	var snapSeq int64
 	if data, err := os.ReadFile(r.snapshotPath()); err == nil {
 		var s snapshotFile
@@ -48,34 +55,99 @@ func OpenRecorder(dir string, lateness time.Duration) (*Recorder, error) {
 		}
 		r.eng = applySnapshot(s)
 		snapSeq = s.Seq
-	} else if errors.Is(err, fs.ErrNotExist) {
-		r.eng = NewEngine(lateness)
-	} else {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
-	// 2) 日志：跳过已被快照覆盖的序号，按序重放增量。
+	// 2) 打开日志。
 	j, err := openFileJournal(r.journalPath())
 	if err != nil {
 		return nil, err
 	}
 	r.journal = j
-	for _, rec := range j.tail {
+
+	if r.eng == nil {
+		// 无快照：设置值以日志里的 RecConfig 记录为准（流式找，找到即停）。
+		recorded, hasConfig, err := j.findConfig()
+		if err != nil {
+			_ = j.Close()
+			return nil, err
+		}
+		switch {
+		case hasConfig:
+			r.lateness = recorded
+		case j.Seq() > 0:
+			// 兼容旧格式日志（无设置记录）：退回调用方传入值。
+			r.lateness = firstLateness(lateness)
+		default:
+			// 全新目录：用传入值（缺省 0）创建，并把设置落盘为第一条记录。
+			r.lateness = firstLateness(lateness)
+			l := r.lateness.Nanoseconds()
+			if _, err := j.Append(Record{Kind: RecConfig, Lateness: &l}); err != nil {
+				_ = j.Close()
+				return nil, err
+			}
+		}
+		r.eng = NewEngine(r.lateness)
+	} else {
+		r.lateness = r.eng.Lateness()
+	}
+
+	// 3) 流式重放：跳过已被快照覆盖的序号与设置记录，按序应用增量。
+	err = j.Scan(func(rec Record) error {
 		if rec.Seq <= snapSeq {
-			continue // 已被快照覆盖：压缩中断留下的重叠部分，跳过即幂等
+			return nil // 已被快照覆盖：压缩中断留下的重叠部分，跳过即幂等
+		}
+		if rec.Kind == RecConfig {
+			return nil // 设置记录已在上面生效
 		}
 		if err := r.apply(rec); err != nil {
-			_ = j.Close()
-			return nil, fmt.Errorf("alert: replay seq=%d: %w", rec.Seq, err)
+			return fmt.Errorf("alert: replay seq=%d: %w", rec.Seq, err)
 		}
+		return nil
+	})
+	if err != nil {
+		_ = j.Close()
+		return nil, err
 	}
 	return r, nil
 }
+
+// firstLateness 取调用方传入的第一个设置值，未传时为 0。
+func firstLateness(v []time.Duration) time.Duration {
+	if len(v) > 0 && v[0] > 0 {
+		return v[0]
+	}
+	return 0
+}
+
+// findConfig 流式扫描日志，返回第一条 RecConfig 记录里的乱序容忍设置。
+func (j *FileJournal) findConfig() (time.Duration, bool, error) {
+	var out time.Duration
+	found := false
+	err := j.Scan(func(rec Record) error {
+		if rec.Kind == RecConfig && rec.Lateness != nil {
+			out = time.Duration(*rec.Lateness)
+			found = true
+			return errStopScan
+		}
+		return nil
+	})
+	if errors.Is(err, errStopScan) {
+		err = nil
+	}
+	return out, found, err
+}
+
+// errStopScan 用于找到目标后提前结束流式扫描（非错误）。
+var errStopScan = errors.New("alert: stop scan")
 
 // apply 把一条日志记录重新作用到引擎上（重放与在线写入共用同一条路径）。
 // 调用方需持有 r.mu。
 func (r *Recorder) apply(rec Record) error {
 	switch rec.Kind {
+	case RecConfig:
+		return nil // 设置记录在打开时已生效，重放无需再处理
 	case RecRule:
 		return r.eng.AddRule(*rec.Rule)
 	case RecEvent:

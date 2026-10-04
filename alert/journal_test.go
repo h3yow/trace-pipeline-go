@@ -18,9 +18,9 @@ import (
 	"github.com/h3yow/trace-pipeline-go/trace"
 )
 
-func mustOpen(t *testing.T, dir string, lateness time.Duration) *Recorder {
+func mustOpen(t *testing.T, dir string, lateness ...time.Duration) *Recorder {
 	t.Helper()
-	r, err := OpenRecorder(dir, lateness)
+	r, err := OpenRecorder(dir, lateness...)
 	if err != nil {
 		t.Fatalf("OpenRecorder(%s): %v", dir, err)
 	}
@@ -419,7 +419,9 @@ func TestCompactionPreservesConclusions(t *testing.T) {
 		cw, fileSize(t, filepath.Join(dir, "journal.log")), fileSize(t, filepath.Join(dir, "snapshot.json")))
 
 	runScript(t, r, "part2")
-	r.Advance(at("23:59:00")) // 最终化并发写入的全部远期桶
+	// 最终化并发写入的全部远期桶：并发写从 09:30 起每条占 1 分钟桶，
+	// 水位必须推过 09:30+cw 分钟（跨天），只推到当天 23:59 会漏掉跨天的桶。
+	r.Advance(at("09:30:00").Add(time.Duration(cw+2) * time.Minute))
 	got := allHistories(r, "a", "b")
 
 	// 实验组 = 对照组结论 + 并发写入的 cw 条（每条一桶、value=1）。
