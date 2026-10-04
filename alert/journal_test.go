@@ -419,7 +419,9 @@ func TestCompactionPreservesConclusions(t *testing.T) {
 		cw, fileSize(t, filepath.Join(dir, "journal.log")), fileSize(t, filepath.Join(dir, "snapshot.json")))
 
 	runScript(t, r, "part2")
-	r.Advance(at("23:59:00")) // 最终化并发写入的全部远期桶
+	// 最终化并发写入的全部远期桶：推进线必须盖过最后一条并发事件
+	// （第 i 条落在 09:30+i 分钟，共 cw 条），写多少就推进到多远。
+	r.Advance(at("09:30:00").Add(time.Duration(cw+1) * time.Minute))
 	got := allHistories(r, "a", "b")
 
 	// 实验组 = 对照组结论 + 并发写入的 cw 条（每条一桶、value=1）。

@@ -279,9 +279,14 @@ func (e *Engine) Advance(t time.Time) []Alert {
 }
 
 // finalize 最终化单个桶：稳定排序 -> 纯函数判定 -> 去重/抑制。调用方持 e.mu。
+// 判定完成后立即释放该桶的事件缓冲：桶已永久关闭（迟到事件会被显式拒绝），
+// 事件内容不再参与任何后续判定；保留的结论（fired/suppressed/finalized 标记与
+// 告警内容）是每桶一条的小对象。由此引擎内存只随"未最终化的开放窗口"增长，
+// 不随累计事件量线性增长。重放走同一代码路径，还原状态与在线一致。
 func (e *Engine) finalize(vs *versionState, b int64) []Alert {
 	vs.finalized[b] = true
 	recs := vs.buckets[b]
+	delete(vs.buckets, b) // 桶已关闭，释放事件缓冲（结论见 fired/suppressed/alerts）
 	sort.SliceStable(recs, func(i, j int) bool {
 		if recs[i].At.Equal(recs[j].At) {
 			return recs[i].arrival < recs[j].arrival

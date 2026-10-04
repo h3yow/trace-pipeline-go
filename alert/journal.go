@@ -7,13 +7,22 @@
 //     拒绝也照实记录，重放时同样被拒绝，结论一致）；
 //   - RecAdvance：一次水位推进（记录调用方请求的目标时间）。
 //
-// 还原：OpenRecorder 先加载快照（若有），再跳过 Seq <= 快照 Seq 的记录、
+// 还原：OpenRecorder 先加载快照（若有），再流式跳过 Seq <= 快照 Seq 的记录、
 // 按序重放其余记录。压缩失败留下的"快照新、日志旧"重叠部分因此天然幂等，
 // 重试压缩或重启恢复都不会重复计数。
+//
+// 内存纪律：FileJournal 不在内存里保留任何已写入的记录——
+//   - Append 只负责把记录编码落盘并推进序号，O(1) 内存；
+//   - Replay / TruncateBefore 都是流式扫描文件（逐行处理，单行缓冲），
+//     内存占用与累计记录数无关。
+//
+// 因此长时间不压缩地持续写入、或重启后重放超长日志，进程内存都不随
+// 累计写入量线性增长（代价是压缩时多一遍顺序读盘，顺序 I/O 代价低）。
 package alert
 
 import (
 	"bufio"
+
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,42 +48,23 @@ type Record struct {
 }
 
 // FileJournal 是追加式文件日志。写盘与截断都由调用方（Recorder）在持锁时调用，
-// 自身不加锁；tail 缓存自上次截断以来的记录，供压缩时重写文件。
+// 自身不加锁。它不缓存任何记录：所有需要回看历史的操作都流式读文件完成。
 type FileJournal struct {
 	f    *os.File
 	path string
-	seq  int64    // 已追加的最大序号
-	tail []Record // 自上次 TruncateBefore 以来追加的全部记录
+	seq  int64 // 已追加的最大序号
 }
 
-// openFileJournal 打开（必要时创建）日志文件并读入既有记录。
+// openFileJournal 打开（必要时创建）日志文件，流式扫一遍既有内容确定当前序号。
+// 扫描只解析 Seq 字段、不保留记录，打开超长日志的内存占用与日志长度无关。
 func openFileJournal(path string) (*FileJournal, error) {
 	j := &FileJournal{path: path}
-	// 先读既有内容（不存在则视为空日志）。
-	if f, err := os.Open(path); err == nil {
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for sc.Scan() {
-			line := sc.Bytes()
-			if len(line) == 0 {
-				continue
-			}
-			var rec Record
-			if err := json.Unmarshal(line, &rec); err != nil {
-				_ = f.Close()
-				return nil, fmt.Errorf("alert: corrupt journal %s: %w", path, err)
-			}
-			j.tail = append(j.tail, rec)
-			if rec.Seq > j.seq {
-				j.seq = rec.Seq
-			}
+	if err := j.scan(func(rec Record, _ []byte) error {
+		if rec.Seq > j.seq {
+			j.seq = rec.Seq
 		}
-		if err := sc.Err(); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-		_ = f.Close()
-	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	// 以追加模式打开供后续写入。
@@ -86,7 +76,50 @@ func openFileJournal(path string) (*FileJournal, error) {
 	return j, nil
 }
 
-// Append 追加一条记录（Seq 自动递增）并落盘，返回该记录的 Seq。
+// scan 流式逐行扫描日志文件（不存在视为空日志），对每条记录回调 fn。
+// raw 为该行的原始字节（不含换行），仅在回调期间有效。
+func (j *FileJournal) scan(fn func(rec Record, raw []byte) error) error {
+	f, err := os.Open(j.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var rec Record
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return fmt.Errorf("alert: corrupt journal %s: %w", j.path, err)
+		}
+		if err := fn(rec, line); err != nil {
+			return err
+		}
+	}
+	return sc.Err()
+}
+
+// Replay 流式重放 Seq > after 的记录（按文件顺序，即 Seq 升序），
+// 已被快照覆盖的序号在扫描时直接跳过，不在内存中累积。
+func (j *FileJournal) Replay(after int64, apply func(Record) error) error {
+	return j.scan(func(rec Record, _ []byte) error {
+		if rec.Seq <= after {
+			return nil // 已被快照覆盖：压缩中断留下的重叠部分，跳过即幂等
+		}
+		if err := apply(rec); err != nil {
+			return fmt.Errorf("alert: replay seq=%d: %w", rec.Seq, err)
+		}
+		return nil
+	})
+}
+
+// Append 追加一条记录（Seq 自动递增）并落盘，返回该记录的 Seq。O(1) 内存。
 func (j *FileJournal) Append(rec Record) (int64, error) {
 	j.seq++
 	rec.Seq = j.seq
@@ -100,32 +133,45 @@ func (j *FileJournal) Append(rec Record) (int64, error) {
 		j.seq--
 		return 0, err
 	}
-	j.tail = append(j.tail, rec)
 	return rec.Seq, nil
 }
 
 // Seq 返回当前最大序号（无记录时为 0）。
 func (j *FileJournal) Seq() int64 { return j.seq }
 
-// TruncateBefore 丢弃 Seq <= keep 的历史记录，把剩余记录原子重写进日志文件。
+// TruncateBefore 丢弃 Seq <= keep 的历史记录：流式读当前日志，把 Seq > keep
+// 的行原样流式写入临时文件后原子替换。全程只持有一行缓冲，内存与日志长度无关。
 // 压缩失败重试安全：只依赖传入的 keep 序号，重复调用结果相同。
 func (j *FileJournal) TruncateBefore(keep int64) error {
-	kept := j.tail[:0]
-	for _, rec := range j.tail {
-		if rec.Seq > keep {
-			kept = append(kept, rec)
-		}
+	tmp := j.path + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
 	}
-	var buf []byte
-	for _, rec := range kept {
-		data, err := json.Marshal(rec)
-		if err != nil {
+	w := bufio.NewWriter(out)
+	scanErr := j.scan(func(rec Record, raw []byte) error {
+		if rec.Seq <= keep {
+			return nil
+		}
+		if _, err := w.Write(raw); err != nil {
 			return err
 		}
-		buf = append(buf, data...)
-		buf = append(buf, '\n')
+		return w.WriteByte('\n')
+	})
+	if scanErr == nil {
+		scanErr = w.Flush()
 	}
-	if err := writeFileAtomic(j.path, buf); err != nil {
+	if scanErr == nil {
+		scanErr = out.Sync()
+	}
+	if cerr := out.Close(); scanErr == nil {
+		scanErr = cerr
+	}
+	if scanErr != nil {
+		_ = os.Remove(tmp)
+		return scanErr
+	}
+	if err := os.Rename(tmp, j.path); err != nil {
 		return err
 	}
 	// 重新以追加模式打开（rename 后旧 fd 指向已替换的 inode）。
@@ -135,7 +181,6 @@ func (j *FileJournal) TruncateBefore(keep int64) error {
 		return err
 	}
 	j.f = f
-	j.tail = append([]Record(nil), kept...)
 	return nil
 }
 

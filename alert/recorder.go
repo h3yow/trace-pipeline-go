@@ -32,42 +32,55 @@ type Recorder struct {
 
 // OpenRecorder 打开（或创建）dir 下的记录目录：
 // 若存在快照则先恢复快照状态，再重放日志中 Seq 大于快照序号的记录；
-// 不存在任何记录时以 lateness 新建引擎。恢复后可直接继续写入。
+// 恢复后可直接继续写入。
+//
+// lateness 只在"全新目录、还不存在任何记录"时生效一次，并立即写入
+// meta.json；之后无论何时、以什么参数重新打开，都以记录里录的设置为准
+// （快照里的同名字段是旧格式目录的兜底）。因此还原不依赖调用方传入值：
+// 录进去的是什么，还原出来就是什么。
 func OpenRecorder(dir string, lateness time.Duration) (*Recorder, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	r := &Recorder{dir: dir, lateness: lateness}
+	r := &Recorder{dir: dir}
 
-	// 1) 快照（压缩基线）：存在则以其为准（lateness 以快照记录为准）。
+	// 1) 快照（压缩基线）：存在则读入，稍后以其状态为准。
+	var snap *snapshotFile
 	var snapSeq int64
 	if data, err := os.ReadFile(r.snapshotPath()); err == nil {
 		var s snapshotFile
 		if err := json.Unmarshal(data, &s); err != nil {
 			return nil, fmt.Errorf("alert: corrupt snapshot: %w", err)
 		}
-		r.eng = applySnapshot(s)
+		snap = &s
 		snapSeq = s.Seq
-	} else if errors.Is(err, fs.ErrNotExist) {
-		r.eng = NewEngine(lateness)
-	} else {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
-	// 2) 日志：跳过已被快照覆盖的序号，按序重放增量。
+	// 2) 生效设置：记录里有的以记录为准，否则采用传入值并落盘。
+	eff, err := resolveLateness(dir, snap, lateness)
+	if err != nil {
+		return nil, err
+	}
+	r.lateness = eff
+
+	// 3) 引擎初态：快照镜像，或按生效设置新建。
+	if snap != nil {
+		r.eng = applySnapshot(*snap)
+	} else {
+		r.eng = NewEngine(eff)
+	}
+
+	// 4) 日志：流式跳过已被快照覆盖的序号，按序重放增量（不在内存累积记录）。
 	j, err := openFileJournal(r.journalPath())
 	if err != nil {
 		return nil, err
 	}
 	r.journal = j
-	for _, rec := range j.tail {
-		if rec.Seq <= snapSeq {
-			continue // 已被快照覆盖：压缩中断留下的重叠部分，跳过即幂等
-		}
-		if err := r.apply(rec); err != nil {
-			_ = j.Close()
-			return nil, fmt.Errorf("alert: replay seq=%d: %w", rec.Seq, err)
-		}
+	if err := j.Replay(snapSeq, r.apply); err != nil {
+		_ = j.Close()
+		return nil, err
 	}
 	return r, nil
 }
@@ -95,6 +108,9 @@ func (r *Recorder) apply(rec Record) error {
 
 // Engine 返回底层引擎（只读用途；直接改引擎会绕过日志，破坏可还原性）。
 func (r *Recorder) Engine() *Engine { return r.eng }
+
+// Lateness 返回本记录实际生效的乱序容忍（来自记录本身，而非本次打开传入值）。
+func (r *Recorder) Lateness() time.Duration { return r.lateness }
 
 // AddRule 应用规则变更并记录。
 func (r *Recorder) AddRule(rule Rule) error {
